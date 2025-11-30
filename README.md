@@ -11,6 +11,35 @@ LuCI application for monitoring Airoha AN7581 NPU (Network Processing Unit) stat
 - Real-time PPE (Packet Processing Engine) flow offload entries
 - Display flow statistics (packets, bytes) for each entry
 
+## AN7581 SoC Architecture
+
+```
++---------------------------------------------------------------+
+|                          AN7581 SoC                           |
+|                                                               |
+|  +--------------+      +----------------------------------+   |
+|  |   ARM CPU    |      |           NPU (RISC-V)           |   |
+|  |   (4x A53)   |      |                                  |   |
+|  |              |      |   +------+------+------+------+  |   |
+|  |   - Linux    |      |   |Core0 |Core1 |Core2 |Core3 |  |   |
+|  |   - Drivers  |      |   +------+------+------+------+  |   |
+|  |   - Apps     |      |   |Core4 |Core5 |Core6 |Core7 |  |   |
+|  +--------------+      |   +------+------+------+------+  |   |
+|         |              |              |                   |   |
+|         |              |      NPU Firmware (TLB)          |   |
+|         |              |      - Packet parsing            |   |
+|         |              |      - Flow lookup (PPE/FOE)     |   |
+|         |              |      - Header rewrite            |   |
+|         |              |      - Queue management          |   |
+|         |              +----------------------------------+   |
+|         |                             |                       |
+|         +-------------+---------------+                       |
+|                       |                                       |
+|               Shared Memory                                   |
+|          (PPE tables, DMA rings, buffers)                     |
++---------------------------------------------------------------+
+```
+
 ## Screenshot
 
 The app adds a "NPU Status" page under Status menu in LuCI showing:
