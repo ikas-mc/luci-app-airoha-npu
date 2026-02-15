@@ -1,80 +1,37 @@
 #!/bin/sh
 
-# Airoha NPU Status RPC backend for LuCI
+# Airoha SoC Status RPC backend for LuCI (NPU + CPU + Overclock)
 
 . /lib/functions.sh
 
-get_npu_version() {
-	# Try to get NPU version from dmesg (from airoha-npu driver)
-	local npu_ver=$(dmesg | grep -i "npu.*version" | tail -1 | sed -n 's/.*version[: ]*\([0-9.]*\).*/\1/p')
-
-	# Try mt7996 NPU version
-	local wifi_npu_ver=$(dmesg | grep -i "mt7996.*npu version" | tail -1 | sed -n 's/.*NPU version[: ]*\([0-9.]*\).*/\1/p')
-
-	# Check if NPU firmware is loaded
-	local npu_loaded="false"
-	if dmesg | grep -q "airoha-npu.*firmware loaded\|NPU version"; then
-		npu_loaded="true"
-	fi
-
-	echo "{\"npu_version\":\"${npu_ver:-Unknown}\",\"wifi_npu_version\":\"${wifi_npu_ver:-Not loaded}\",\"npu_loaded\":${npu_loaded}}"
-}
-
-get_memory_regions() {
-	# Parse NPU reserved memory regions from dmesg
-	local regions="["
-	local first=1
-
-	dmesg | grep "reserved mem.*npu" | while read line; do
-		local start=$(echo "$line" | sed -n 's/.*0x\([0-9a-fA-F]*\)\.\..*/\1/p')
-		local end=$(echo "$line" | sed -n 's/.*\.\.\(0x[0-9a-fA-F]*\).*/\1/p')
-		local size=$(echo "$line" | sed -n 's/.*(\([0-9]* [KMG]*B\)).*/\1/p')
-		local name=$(echo "$line" | sed -n 's/.*non-reusable \([^ ]*\)/\1/p')
-
-		if [ -n "$start" ] && [ -n "$name" ]; then
-			[ $first -eq 0 ] && echo -n ","
-			first=0
-			echo -n "{\"name\":\"$name\",\"start\":\"0x$start\",\"end\":\"$end\",\"size\":\"$size\"}"
-		fi
-	done
-	echo "]"
-}
-
 get_status() {
-	# Get NPU firmware version from the firmware binary itself
+	# === NPU Status ===
 	local npu_fw="/lib/firmware/airoha/en7581_npu_rv32.bin"
 	local npu_ver="Unknown"
 
 	if [ -f "$npu_fw" ]; then
-		# Extract TLB version string from firmware binary
-		# Handles formats: "2.1.1-TLB7.3.283.1456-62", "TLB7.7.0.0_v01", "TLB7.3.283.2400-32"
 		npu_ver=$(strings "$npu_fw" 2>/dev/null | grep -oE '([0-9]+\.[0-9]+\.[0-9]+-)?TLB[0-9.]+[-_v0-9]*' | head -1)
 		[ -z "$npu_ver" ] && npu_ver="Unknown"
 	fi
 
-	# Check if NPU device is bound (active) by looking for *.npu symlink in driver directory
 	local npu_loaded="false"
 	local npu_device=""
 	local npu_driver_path="/sys/bus/platform/drivers/airoha-npu"
 
 	if [ -d "$npu_driver_path" ]; then
-		# Find any bound NPU device (e.g., 1e900000.npu)
 		npu_device=$(ls -1 "$npu_driver_path" 2>/dev/null | grep '\.npu$' | head -1)
 		if [ -n "$npu_device" ]; then
 			npu_loaded="true"
 		fi
 	fi
 
-	# Get NPU clock speed (Hz -> MHz)
 	local npu_clock=0
 	if [ -f "/sys/kernel/debug/clk/npu/clk_rate" ]; then
 		npu_clock=$(cat /sys/kernel/debug/clk/npu/clk_rate 2>/dev/null || echo 0)
 	fi
 
-	# Count NPU cores from watchdog IRQs (airoha-npu-wdt)
 	local npu_cores=$(grep -c "airoha-npu-wdt" /proc/interrupts 2>/dev/null || echo 0)
 
-	# Get offload statistics from bound entries
 	local offload_stats=$(cat /sys/kernel/debug/ppe/bind 2>/dev/null | awk '
 	BEGIN { total_pkts=0; total_bytes=0 }
 	{
@@ -88,14 +45,6 @@ get_status() {
 	local offload_packets=$(echo "$offload_stats" | cut -d' ' -f1)
 	local offload_bytes=$(echo "$offload_stats" | cut -d' ' -f2)
 
-	# Get memory regions
-	local regions="["
-	local first=1
-	for line in $(dmesg | grep "reserved mem.*npu" 2>/dev/null); do
-		:
-	done
-
-	# Simplified memory region parsing
 	local mem_info=$(dmesg | grep "reserved mem.*npu" | head -4)
 	local regions="[]"
 
@@ -107,22 +56,64 @@ get_status() {
 			match($0, /0x[0-9a-fA-F]+\.\.0x[0-9a-fA-F]+/)
 			range = substr($0, RSTART, RLENGTH)
 			split(range, a, "\\.\\.")
-
 			match($0, /\([0-9]+ [KMG]i?B\)/)
 			size = substr($0, RSTART+1, RLENGTH-2)
-
 			match($0, /non-reusable [^ ]+/)
 			name = substr($0, RSTART+13)
 			gsub(/@.*/, "", name)
-
 			printf "{\"name\":\"%s\",\"start\":\"%s\",\"end\":\"%s\",\"size\":\"%s\"}", name, a[1], a[2], size
 		}
 		END { printf "]" }
 		')
 	fi
 
-	printf '{"npu_version":"%s","npu_loaded":%s,"npu_device":"%s","npu_clock":%d,"npu_cores":%d,"offload_packets":%d,"offload_bytes":%d,"memory_regions":%s}' \
-		"${npu_ver:-Unknown}" "$npu_loaded" "${npu_device:-}" "${npu_clock:-0}" "${npu_cores:-0}" "${offload_packets:-0}" "${offload_bytes:-0}" "$regions"
+	# === CPU Frequency Status ===
+	local cpufreq_path="/sys/devices/system/cpu/cpufreq/policy0"
+	local cpu_cur_freq=0
+	local cpu_hw_freq=0
+	local cpu_governor="unknown"
+	local cpu_avail_governors=""
+	local cpu_min_freq=0
+	local cpu_max_freq=0
+	local cpu_avail_freqs=""
+
+	if [ -d "$cpufreq_path" ]; then
+		cpu_cur_freq=$(cat "$cpufreq_path/scaling_cur_freq" 2>/dev/null || echo 0)
+		cpu_hw_freq=$(cat "$cpufreq_path/cpuinfo_cur_freq" 2>/dev/null || echo 0)
+		cpu_governor=$(cat "$cpufreq_path/scaling_governor" 2>/dev/null || echo "unknown")
+		cpu_avail_governors=$(cat "$cpufreq_path/scaling_available_governors" 2>/dev/null || echo "")
+		cpu_min_freq=$(cat "$cpufreq_path/scaling_min_freq" 2>/dev/null || echo 0)
+		cpu_max_freq=$(cat "$cpufreq_path/scaling_max_freq" 2>/dev/null || echo 0)
+		cpu_avail_freqs=$(cat "$cpufreq_path/scaling_available_frequencies" 2>/dev/null || echo "")
+	fi
+
+	# Read actual PLL frequency from hardware (detects overclock)
+	local pll_freq=0
+	if command -v devmem > /dev/null 2>&1; then
+		local pcw_raw=$(devmem 0x1fa202b4 2>/dev/null)
+		local chg_raw=$(devmem 0x1fa202b8 2>/dev/null)
+		if [ -n "$pcw_raw" ] && [ -n "$chg_raw" ]; then
+			pcw_raw=$((pcw_raw))
+			chg_raw=$((chg_raw))
+			local pcw_int=$(( (pcw_raw >> 24) & 0x7F ))
+			local pll_posdiv=$(( (chg_raw >> 4) & 7 ))
+			if [ "$pll_posdiv" -eq 0 ]; then
+				pll_freq=$((pcw_int * 50))
+			else
+				pll_freq=$((pcw_int * 50 / (1 << pll_posdiv)))
+			fi
+		fi
+	fi
+
+	# Count online CPUs
+	local cpu_count=0
+	if [ -d "/sys/devices/system/cpu" ]; then
+		cpu_count=$(ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | wc -l)
+	fi
+
+	printf '{"npu_version":"%s","npu_loaded":%s,"npu_device":"%s","npu_clock":%d,"npu_cores":%d,"offload_packets":%d,"offload_bytes":%d,"memory_regions":%s,"cpu_cur_freq":%d,"cpu_hw_freq":%d,"cpu_governor":"%s","cpu_avail_governors":"%s","cpu_min_freq":%d,"cpu_max_freq":%d,"cpu_avail_freqs":"%s","cpu_count":%d,"pll_freq_mhz":%d}' \
+		"${npu_ver:-Unknown}" "$npu_loaded" "${npu_device:-}" "${npu_clock:-0}" "${npu_cores:-0}" "${offload_packets:-0}" "${offload_bytes:-0}" "$regions" \
+		"${cpu_cur_freq:-0}" "${cpu_hw_freq:-0}" "${cpu_governor:-unknown}" "${cpu_avail_governors:-}" "${cpu_min_freq:-0}" "${cpu_max_freq:-0}" "${cpu_avail_freqs:-}" "${cpu_count:-0}" "${pll_freq:-0}"
 }
 
 get_ppe_entries() {
@@ -133,10 +124,6 @@ get_ppe_entries() {
 		return
 	fi
 
-	# Parse PPE entries
-	# Format: INDEX STATE TYPE [SUBTYPE] orig=... new=... eth=... packets=N bytes=N
-	# Example: 00950 UNB IPv4 5T orig=10.42.1.227:42400->224.0.0.251:0 new=...
-	# Example: 026a4 UNB     L2B eth=...
 	awk '
 	BEGIN {
 		printf "{\"entries\":["
@@ -146,11 +133,9 @@ get_ppe_entries() {
 		if (first == 0) printf ","
 		first = 0
 
-		# Parse index and state (first two fields)
 		index_val = $1
 		state = $2
 
-		# Determine type - could be IPv4, IPv6, or L2B
 		type = ""
 		subtype = ""
 		if ($3 == "IPv4" || $3 == "IPv6") {
@@ -164,35 +149,30 @@ get_ppe_entries() {
 			subtype = $4
 		}
 
-		# Extract orig= field (IP flows)
 		orig = ""
 		match($0, /orig=[^ ]+/)
 		if (RSTART > 0) {
 			orig = substr($0, RSTART+5, RLENGTH-5)
 		}
 
-		# Extract new= field
 		new_flow = ""
 		match($0, /new=[^ ]+/)
 		if (RSTART > 0) {
 			new_flow = substr($0, RSTART+4, RLENGTH-4)
 		}
 
-		# Extract eth= field (for L2B entries)
 		eth = ""
 		match($0, /eth=[^ ]+/)
 		if (RSTART > 0) {
 			eth = substr($0, RSTART+4, RLENGTH-4)
 		}
 
-		# Extract packets=
 		packets = 0
 		match($0, /packets=[0-9]+/)
 		if (RSTART > 0) {
 			packets = substr($0, RSTART+8, RLENGTH-8)
 		}
 
-		# Extract bytes=
 		bytes = 0
 		match($0, /bytes=[0-9]+/)
 		if (RSTART > 0) {
@@ -208,9 +188,157 @@ get_ppe_entries() {
 	' "$entries_file" 2>/dev/null || echo '{"entries":[]}'
 }
 
+set_governor() {
+	local governor
+	governor=$(echo "$1" | jsonfilter -e "@.governor" 2>/dev/null)
+
+	if [ -z "$governor" ]; then
+		echo '{"error":"missing governor parameter"}'
+		return
+	fi
+
+	# Validate governor is available
+	local avail=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null)
+	if ! echo "$avail" | grep -qw "$governor"; then
+		printf '{"error":"invalid governor: %s"}' "$governor"
+		return
+	fi
+
+	echo "$governor" > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor 2>/dev/null
+	if [ $? -eq 0 ]; then
+		printf '{"result":"ok","governor":"%s"}' "$governor"
+	else
+		echo '{"error":"failed to set governor"}'
+	fi
+}
+
+set_max_freq() {
+	local freq
+	freq=$(echo "$1" | jsonfilter -e "@.freq" 2>/dev/null)
+
+	if [ -z "$freq" ]; then
+		echo '{"error":"missing freq parameter"}'
+		return
+	fi
+
+	# Validate freq is in available list
+	local avail=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_available_frequencies 2>/dev/null)
+	if ! echo "$avail" | grep -qw "$freq"; then
+		printf '{"error":"invalid frequency: %s"}' "$freq"
+		return
+	fi
+
+	echo "$freq" > /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq 2>/dev/null
+	if [ $? -eq 0 ]; then
+		printf '{"result":"ok","freq":%d}' "$freq"
+	else
+		echo '{"error":"failed to set max frequency"}'
+	fi
+}
+
+set_overclock() {
+	local target_mhz
+	target_mhz=$(echo "$1" | jsonfilter -e "@.freq_mhz" 2>/dev/null)
+
+	if [ -z "$target_mhz" ]; then
+		echo '{"error":"missing freq_mhz parameter"}'
+		return
+	fi
+
+	# Validate range (500-1600, crash likely above 1500 at stock voltage)
+	if [ "$target_mhz" -lt 500 ] || [ "$target_mhz" -gt 1600 ]; then
+		echo '{"error":"frequency must be 500-1600 MHz"}'
+		return
+	fi
+
+	if ! command -v devmem > /dev/null 2>&1; then
+		echo '{"error":"devmem not available"}'
+		return
+	fi
+
+	# Calculate PCW and posdiv
+	local posdiv pcw_int
+	if [ "$target_mhz" -lt 1000 ]; then
+		posdiv=1
+		pcw_int=$((target_mhz / 25))
+	else
+		posdiv=0
+		pcw_int=$((target_mhz / 50))
+	fi
+
+	# Lock governor to performance to prevent cpufreq from fighting
+	echo performance > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor 2>/dev/null
+
+	# Read current register values
+	local cur_clkmux=$(($(devmem 0x1fa201e0)))
+	local cur_pcw=$(($(devmem 0x1fa202b4)))
+	local cur_chg=$(($(devmem 0x1fa202b8)))
+
+	# Step 1: Enable PLL2 path in CLK_MUX (set bit 2)
+	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux | 0x4)))
+
+	# Step 2: MCUCFG switch to PLL2 (sel=3 in bits[10:9])
+	local cur_u=$(($(devmem 0x1efbe640)))
+	devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u & 0xFFFFFFE0) | 0x12)))
+	local cur_s=$(($(devmem 0x1efbe7c0)))
+	devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s & 0xFFFFF9FF) | (3 << 9))))
+
+	# Step 3: Unlock PLL registers
+	local cur_p=$(($(devmem 0x1fa20268)))
+	devmem 0x1fa20268 32 $(printf "0x%08X" $(((cur_p & 0xFFFFFF00) | 0x12)))
+
+	# Step 4: Write new PCW integer
+	devmem 0x1fa202b4 32 $(printf "0x%08X" $(((cur_pcw & 0x00FFFFFF) | (pcw_int << 24))))
+
+	# Step 5: Write posdiv and toggle CHG bit
+	local chg_bit=$((cur_chg & 1))
+	local cleared=$((cur_chg & 0xFFFFFF8E))
+	if [ "$chg_bit" -eq 1 ]; then
+		devmem 0x1fa202b8 32 $(printf "0x%08X" $((cleared | (posdiv << 4))))
+	else
+		devmem 0x1fa202b8 32 $(printf "0x%08X" $((cleared | (posdiv << 4) | 1)))
+	fi
+
+	# Step 6: Wait for PLL lock
+	sleep 0.02
+
+	# Step 7: Enable ARMPLL path in CLK_MUX (set bit 0)
+	local cur_clkmux2=$(($(devmem 0x1fa201e0)))
+	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux2 | 0x1)))
+
+	# Step 8: MCUCFG switch back to ARMPLL
+	local cur_u2=$(($(devmem 0x1efbe640)))
+	devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u2 & 0xFFFFFFE0) | 0x12)))
+	local cur_s2=$(($(devmem 0x1efbe7c0)))
+	devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s2 & 0xFFFFF9FF) | (1 << 9))))
+
+	# Step 9: Clear PLL2 path in CLK_MUX
+	local cur_clkmux3=$(($(devmem 0x1fa201e0)))
+	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux3 & 0xFFFFFFFB)))
+
+	# Step 10: Re-lock PLL registers
+	local cur_p2=$(($(devmem 0x1fa20268)))
+	devmem 0x1fa20268 32 $(printf "0x%08X" $((cur_p2 & 0xFFFFFF00)))
+
+	# Verify
+	local final_pcw=$(($(devmem 0x1fa202b4)))
+	local final_chg=$(($(devmem 0x1fa202b8)))
+	local read_pcw=$(( (final_pcw >> 24) & 0x7F ))
+	local read_posdiv=$(( (final_chg >> 4) & 7 ))
+	local read_freq
+	if [ "$read_posdiv" -eq 0 ]; then
+		read_freq=$((read_pcw * 50))
+	else
+		read_freq=$((read_pcw * 50 / (1 << read_posdiv)))
+	fi
+
+	printf '{"result":"ok","target_mhz":%d,"actual_mhz":%d,"pcw":%d,"posdiv":%d}' \
+		"$target_mhz" "$read_freq" "$read_pcw" "$read_posdiv"
+}
+
 case "$1" in
 	list)
-		echo '{"getStatus":{},"getPpeEntries":{}}'
+		echo '{"getStatus":{},"getPpeEntries":{},"setGovernor":{"governor":"str"},"setMaxFreq":{"freq":"int"},"setOverclock":{"freq_mhz":"int"}}'
 		;;
 	call)
 		case "$2" in
@@ -219,6 +347,18 @@ case "$1" in
 				;;
 			getPpeEntries)
 				get_ppe_entries
+				;;
+			setGovernor)
+				read input
+				set_governor "$input"
+				;;
+			setMaxFreq)
+				read input
+				set_max_freq "$input"
+				;;
+			setOverclock)
+				read input
+				set_overclock "$input"
 				;;
 			*)
 				echo '{"error":"Invalid method"}'

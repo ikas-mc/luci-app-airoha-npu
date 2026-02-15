@@ -1,132 +1,64 @@
 # luci-app-airoha-npu
 
-LuCI application for monitoring Airoha AN7581 NPU (Network Processing Unit) status on OpenWrt.
+LuCI status page for Airoha AN7581 SoC on OpenWrt. Covers CPU frequency control, NPU monitoring, and PPE flow offload.
+
+![SoC Status](screenshots/soc-status.png)
 
 ## Features
 
-- Display NPU firmware version (TLB version format)
-- Show NPU load status (loaded/not loaded)
-- Display WiFi NPU offload version (MT7996/MT7992)
-- Show NPU reserved memory regions with addresses and sizes
-- Real-time PPE (Packet Processing Engine) flow offload entries
-- Display flow statistics (packets, bytes) for each entry
+### CPU Frequency
+- Live frequency bar with real-time polling
+- Governor selection (ondemand, performance, powersave, etc.)
+- Max frequency control via OPP table (500-1400 MHz)
+- Direct PLL overclock up to 1600 MHz via devmem (bypasses cpufreq)
+- Overclock detection -- bar turns orange with (OC) label when running above OPP max
 
-## AN7581 SoC Architecture
+### NPU
+- Firmware version (TLB format)
+- NPU load status and device binding
+- Clock speed and core count (8 RISC-V cores)
+- Reserved memory regions with sizes
 
-```
-+---------------------------------------------------------------+
-|                          AN7581 SoC                           |
-|                                                               |
-|  +--------------+      +----------------------------------+   |
-|  |   ARM CPU    |      |           NPU (RISC-V)           |   |
-|  |   (4x A53)   |      |                                  |   |
-|  |              |      |   +------+------+------+------+  |   |
-|  |   - Linux    |      |   |Core0 |Core1 |Core2 |Core3 |  |   |
-|  |   - Drivers  |      |   +------+------+------+------+  |   |
-|  |   - Apps     |      |   |Core4 |Core5 |Core6 |Core7 |  |   |
-|  +--------------+      |   +------+------+------+------+  |   |
-|         |              |              |                   |   |
-|         |              |      NPU Firmware (TLB)          |   |
-|         |              |      - Packet parsing            |   |
-|         |              |      - Flow lookup (PPE/FOE)     |   |
-|         |              |      - Header rewrite            |   |
-|         |              |      - Queue management          |   |
-|         |              +----------------------------------+   |
-|         |                             |                       |
-|         +-------------+---------------+                       |
-|                       |                                       |
-|               Shared Memory                                   |
-|          (PPE tables, DMA rings, buffers)                     |
-+---------------------------------------------------------------+
-```
-
-## Screenshot
-
-The app adds a "NPU Status" page under Status menu in LuCI showing:
-- NPU Information (version, status)
-- NPU Memory Regions (npu-binary, npu-pkt, npu-txpkt, npu-txbufid)
-- PPE Flow Offload Entries table with state, type, flows, and statistics
+### PPE Flow Offload
+- Real-time PPE flow entries table (state, type, original/new flow, ethernet)
+- Per-flow packet and byte counters
+- Bound/unbound flow summary
 
 ## Installation
 
 ### From OpenWrt Feeds
 
-Add this package to your OpenWrt build:
-
 ```bash
-# Copy to feeds/luci/applications/
 cp -r luci-app-airoha-npu feeds/luci/applications/
-
-# Update and install
 ./scripts/feeds update luci
 ./scripts/feeds install luci-app-airoha-npu
-
-# Enable in menuconfig
-make menuconfig
-# Navigate to: LuCI -> Applications -> luci-app-airoha-npu
-
-# Build
+make menuconfig  # LuCI -> Applications -> luci-app-airoha-npu
 make package/feeds/luci/luci-app-airoha-npu/compile
 ```
 
-### Manual Installation
-
-Copy files directly to your router:
+### Manual Install
 
 ```bash
-# Create directories
-mkdir -p /usr/share/luci/menu.d
-mkdir -p /usr/share/rpcd/acl.d
-mkdir -p /usr/libexec/rpcd
-mkdir -p /www/luci-static/resources/view/airoha_npu
-
-# Copy files
-cp root/usr/share/luci/menu.d/luci-app-airoha-npu.json /usr/share/luci/menu.d/
-cp root/usr/share/rpcd/acl.d/luci-app-airoha-npu.json /usr/share/rpcd/acl.d/
-cp root/usr/libexec/rpcd/luci.airoha_npu /usr/libexec/rpcd/
-cp htdocs/luci-static/resources/view/airoha_npu/status.js /www/luci-static/resources/view/airoha_npu/
-
-# Set permissions and restart rpcd
-chmod +x /usr/libexec/rpcd/luci.airoha_npu
-/etc/init.d/rpcd restart
+scp root/usr/libexec/rpcd/luci.airoha_npu root@router:/usr/libexec/rpcd/
+scp root/usr/share/luci/menu.d/luci-app-airoha-npu.json root@router:/usr/share/luci/menu.d/
+scp root/usr/share/rpcd/acl.d/luci-app-airoha-npu.json root@router:/usr/share/rpcd/acl.d/
+scp htdocs/luci-static/resources/view/airoha_npu/status.js root@router:/www/luci-static/resources/view/airoha_npu/
+ssh root@router "chmod +x /usr/libexec/rpcd/luci.airoha_npu && /etc/init.d/rpcd restart"
 ```
 
 ## Requirements
 
-- OpenWrt with LuCI
-- Airoha AN7581 target (`@TARGET_airoha`)
+- OpenWrt with LuCI on Airoha AN7581
 - PPE debugfs enabled (`/sys/kernel/debug/ppe/entries`)
+- `devmem` for overclock feature
 
-## Files
+## Notes
 
-```
-luci-app-airoha-npu/
-├── Makefile                                          # OpenWrt package makefile
-├── htdocs/
-│   └── luci-static/resources/view/airoha_npu/
-│       └── status.js                                 # LuCI JavaScript view
-└── root/
-    └── usr/
-        ├── libexec/rpcd/
-        │   └── luci.airoha_npu                       # RPC backend script
-        └── share/
-            ├── luci/menu.d/
-            │   └── luci-app-airoha-npu.json          # Menu configuration
-            └── rpcd/acl.d/
-                └── luci-app-airoha-npu.json          # ACL permissions
-```
-
-## Data Sources
-
-The app reads data from:
-- `dmesg` - NPU version, memory regions, load status
-- `/sys/kernel/debug/ppe/entries` - PPE flow offload table
-- `/sys/kernel/debug/ppe/bind` - Bound PPE entries
+- Governor and max frequency changes are **not persistent** across reboot
+- Overclock writes PLL registers directly -- same method as ATF BL31 `en7523_armpll_set()`
+- Frequencies above 1400 MHz may be unstable at stock voltage (~640 mV)
+- OPP table supports 500-1400 MHz in 50 MHz steps (levels 0-18)
 
 ## License
 
 Apache-2.0
-
-## Author
-
-Created for W1700K router (Airoha AN7581 + MT7996 BE19000)
